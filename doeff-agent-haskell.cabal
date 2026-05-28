@@ -1,0 +1,38 @@
+cabal-version: 3.0
+name: doeff-agent-haskell
+version: 0.1.0.0
+synopsis: Haskell client for doeff-agentd
+license: MIT
+author: s22625
+maintainer: s22625
+build-type: Simple
+
+common warnings
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wpartial-fields
+
+library
+  import: warnings
+  exposed-modules:
+      Doeff.Agentd.Client
+  hs-source-dirs: src
+  default-language: Haskell2010
+  default-extensions:
+      DeriveAnyClass
+      DeriveGeneric
+      DerivingStrategies
+      LambdaCase
+      OverloadedStrings
+      RecordWildCards
+      ScopedTypeVariables
+  build-depends:
+      aeson >=2.1,
+      async,
+      base >=4.17 && <5,
+      bytestring,
+      containers,
+      directory,
+      filepath,
+      network,
+      text,
+      time,
+      vector
