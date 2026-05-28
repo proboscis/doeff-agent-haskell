@@ -15,6 +15,9 @@ module Doeff.Agentd.Client
     AgentdSnapshot (..),
     AgentdTerminalCause (..),
     AgentdWaitOptions (..),
+    AwaitError (..),
+    AwaitedPayload (..),
+    AwaitedResult (..),
     ExpectedResultRequest (..),
     LaunchRequest (..),
     SessionLifecycle (..),
@@ -29,6 +32,7 @@ module Doeff.Agentd.Client
     parseSnapshot,
     pollRunResult,
     request,
+    sessionAwaitResult,
     sessionCancel,
     sessionCapture,
     sessionCleanup,
@@ -383,6 +387,178 @@ readLine sock chunkSize buffer
             then ioError (userError "agentd closed connection before responding")
             else pure buffer
         else readLine sock chunkSize (buffer <> chunk)
+
+-- | Result returned by @session.await_result@.  The session snapshot
+-- is always present; 'awaitedResult' is @Nothing@ when no
+-- 'ExpectedResult' contract was attached at launch time (or when the
+-- agentd validation gave up but still produced a terminal snapshot).
+data AwaitedResult = AwaitedResult
+  { awaitedSession :: AgentdSnapshot,
+    awaitedResult :: Maybe AwaitedPayload,
+    awaitedValidationError :: Maybe Text
+  }
+  deriving stock (Eq, Show, Generic)
+
+instance FromJSON AwaitedResult where
+  parseJSON = Aeson.withObject "AwaitedResult" $ \obj -> do
+    awaitedSession <- obj .: "session" >>= snapshotFromValue
+    awaitedResult <- obj .:? "result" .!= Nothing
+    awaitedValidationError <- obj .:? "validation_error"
+    pure AwaitedResult {..}
+    where
+      snapshotFromValue value = case parseSnapshot value of
+        Right snap -> pure snap
+        Left err -> fail (show err)
+
+instance ToJSON AwaitedResult where
+  toJSON AwaitedResult {..} =
+    object
+      [ "session" .= awaitedSession,
+        "result" .= awaitedResult,
+        "validation_error" .= awaitedValidationError
+      ]
+
+-- | Typed-result payload nested in 'AwaitedResult'.  Mirrors the wire
+-- shape returned by @session.await_result@ exactly so audit-log
+-- consumers can round-trip the value.
+data AwaitedPayload = AwaitedPayload
+  { awaitedSchemaName :: Text,
+    awaitedSchemaVersion :: Int,
+    awaitedPayload :: Value
+  }
+  deriving stock (Eq, Show, Generic)
+
+instance FromJSON AwaitedPayload where
+  parseJSON = Aeson.withObject "AwaitedPayload" $ \obj -> do
+    awaitedSchemaName <- obj .: "schema_name"
+    awaitedSchemaVersion <- obj .: "schema_version"
+    awaitedPayload <- obj .: "payload"
+    pure AwaitedPayload {..}
+
+instance ToJSON AwaitedPayload where
+  toJSON AwaitedPayload {..} =
+    object
+      [ "schema_name" .= awaitedSchemaName,
+        "schema_version" .= awaitedSchemaVersion,
+        "payload" .= awaitedPayload
+      ]
+
+-- | Errors specific to 'sessionAwaitResult'.  Distinct from
+-- 'AgentdError' so callers can pattern-match on the JSON-RPC error
+-- code without re-parsing a free-form message.  @code@ matches the
+-- agentd-side error code (-32000 timeout, -32001 no such session,
+-- ... other for protocol / server errors).
+data AwaitError
+  = AwaitSocketError String
+  | AwaitProtocolError String
+  | AwaitServerError {awaitErrorCode :: Int, awaitErrorMessage :: String}
+  deriving stock (Eq, Show, Generic)
+
+-- | Block until the agentd session reaches a terminal state, then
+-- return the validated @expected_result@ envelope (if any) along
+-- with the final snapshot.
+--
+-- The transport here intentionally bypasses the generic 'request'
+-- helper so the server-side JSON-RPC error @code@ can be surfaced
+-- verbatim to the caller — 'request' collapses code + message into
+-- a single string and callers need to distinguish -32000 (timeout)
+-- from -32001 (no such session).
+--
+-- Transport timeout: the Unix-socket recv blocks indefinitely, which
+-- is correct for a long-poll RPC.  Agentd is responsible for
+-- enforcing @timeout_seconds@ and replying with code -32000 when the
+-- session has not reached a terminal state by the deadline.
+sessionAwaitResult ::
+  AgentdConfig ->
+  -- | Session id
+  Text ->
+  -- | Optional timeout in seconds (defaults agentd-side to 600).
+  Maybe Double ->
+  IO (Either AwaitError AwaitedResult)
+sessionAwaitResult AgentdConfig {..} sid timeoutSeconds = do
+  rid <- nextRequestId
+  let params = object $
+        ["session_id" .= sid]
+          ++ maybe [] (\t -> ["timeout_seconds" .= t]) timeoutSeconds
+      payload =
+        object
+          [ "id" .= rid,
+            "method" .= ("session.await_result" :: Text),
+            "params" .= params
+          ]
+      encoded = LBS.toStrict (encode payload) <> "\n"
+  socketResult <-
+    try $ bracket openSock close $ \sock -> do
+      Net.sendAll sock encoded
+      readLine sock agentdReadBufferBytes mempty
+  case socketResult of
+    Left (err :: IOException) ->
+      pure (Left (AwaitSocketError (show err)))
+    Right rawLine -> pure (decodeAwaitResponse rid rawLine)
+  where
+    openSock = do
+      s <- socket AF_UNIX Stream 0
+      connect s (SockAddrUnix agentdSocketPath)
+      pure s
+
+decodeAwaitResponse :: Int -> BS.ByteString -> Either AwaitError AwaitedResult
+decodeAwaitResponse expectedId rawLine =
+  case decodeStrict rawLine :: Maybe Value of
+    Nothing ->
+      Left (AwaitProtocolError ("invalid JSON response: " <> BSC.unpack rawLine))
+    Just (Object obj) ->
+      case parseEither (parseAwaitResponse expectedId) (Object obj) of
+        Left err -> Left (AwaitProtocolError err)
+        Right outcome -> outcome
+    Just _ ->
+      Left (AwaitProtocolError "agentd returned a non-object response")
+
+-- | Parse the agentd JSON-RPC envelope, recovering the server-side
+-- error @code@.
+--
+-- Agentd's @RpcResponse@ envelope is intentionally NOT JSON-RPC 2.0:
+-- the @error@ field is a flat string, and an optional sibling
+-- top-level @error_code@ carries the integer code.  Nesting the code
+-- inside the error object would break the existing Python client at
+-- @packages/doeff-agents/src/doeff_agents/agentd_client.py@ which
+-- reads @error@ as a string.  We mirror that flat shape here so a
+-- single Haskell + Python wire spec is preserved.
+parseAwaitResponse :: Int -> Value -> Parser (Either AwaitError AwaitedResult)
+parseAwaitResponse expectedId = Aeson.withObject "AwaitedResponse" $ \obj -> do
+  rid <- obj .: "id"
+  ok <- obj .: "ok"
+  result <- obj .:? "result"
+  errMessage <- obj .:? "error" :: Parser (Maybe Text)
+  errorCode <- obj .:? "error_code" :: Parser (Maybe Int)
+  if rid /= expectedId
+    then pure (Left (AwaitProtocolError "response id did not match request id"))
+    else
+      if ok
+        then case result of
+          Just value -> case Aeson.fromJSON value of
+            Aeson.Success parsed -> pure (Right parsed)
+            Aeson.Error err ->
+              pure
+                ( Left
+                    ( AwaitProtocolError
+                        ("session.await_result result failed to parse: " <> err)
+                    )
+                )
+          Nothing ->
+            pure
+              ( Left
+                  ( AwaitProtocolError
+                      "session.await_result returned ok=true with no result"
+                  )
+              )
+        else
+          let message = case errMessage of
+                Just m | not (T.null m) -> T.unpack m
+                _ -> "agentd request failed"
+              code = case errorCode of
+                Just c -> c
+                Nothing -> 0
+           in pure (Left (AwaitServerError code message))
 
 daemonStatus :: AgentdConfig -> IO (Either AgentdError Value)
 daemonStatus cfg = request cfg "daemon.status" (object [])
