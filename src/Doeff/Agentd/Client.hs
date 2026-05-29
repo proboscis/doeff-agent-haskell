@@ -144,29 +144,21 @@ data LaunchRequest = LaunchRequest
   }
   deriving stock (Eq, Show)
 
-data ExpectedResultRequest = ExpectedResultRequest
-  { erFilePath :: FilePath,
-    erSchemaName :: Maybe Text,
-    erSchemaVersion :: Maybe Int,
-    erRetryPrompt :: Maybe Text,
-    erMaxRetries :: Maybe Int,
-    -- | Optional JSON-Schema (a constrained subset agentd understands)
-    -- the envelope's inner @payload@ object must satisfy.  Carried as a
-    -- raw 'Value' so this client stays agnostic to any particular
-    -- result shape — the launcher owns the schema, agentd just enforces
-    -- it and feeds violations back through the @retry_prompt@ loop.
-    erPayloadSchema :: Maybe Value
+-- | The result contract the launcher attaches to a launch.  Mirrors
+-- @doeff-agentd@'s @ExpectedResultSpec@: the launcher supplies ONLY the
+-- JSON-Schema (a constrained subset agentd understands) the agent's
+-- result must satisfy.  agentd owns the rest of the transmission
+-- contract — the result file path, the instruction it injects into the
+-- agent, validation, and the retry loop.  Carried as a raw 'Value' so
+-- this client stays agnostic to any particular result shape.
+newtype ExpectedResultRequest = ExpectedResultRequest
+  { erPayloadSchema :: Value
   }
   deriving stock (Eq, Show)
 
 instance FromJSON ExpectedResultRequest where
   parseJSON = Aeson.withObject "ExpectedResultRequest" $ \obj -> do
-    erFilePath <- obj .: "file_path"
-    erSchemaName <- obj .:? "schema_name"
-    erSchemaVersion <- obj .:? "schema_version"
-    erRetryPrompt <- obj .:? "retry_prompt"
-    erMaxRetries <- obj .:? "max_retries"
-    erPayloadSchema <- obj .:? "payload_schema"
+    erPayloadSchema <- obj .: "payload_schema"
     pure ExpectedResultRequest {..}
 
 instance ToJSON ExpectedResultRequest where
@@ -425,29 +417,24 @@ instance ToJSON AwaitedResult where
         "validation_error" .= awaitedValidationError
       ]
 
--- | Typed-result payload nested in 'AwaitedResult'.  Mirrors the wire
--- shape returned by @session.await_result@ exactly so audit-log
--- consumers can round-trip the value.
-data AwaitedPayload = AwaitedPayload
-  { awaitedSchemaName :: Text,
-    awaitedSchemaVersion :: Int,
-    awaitedPayload :: Value
+-- | Result payload nested in 'AwaitedResult'.  Mirrors the wire shape
+-- returned by @session.await_result@: agentd hands back the validated
+-- result file content under @payload@.  There is no envelope — the file
+-- content IS the payload — so this carries only the value itself.
+newtype AwaitedPayload = AwaitedPayload
+  { awaitedPayload :: Value
   }
   deriving stock (Eq, Show, Generic)
 
 instance FromJSON AwaitedPayload where
   parseJSON = Aeson.withObject "AwaitedPayload" $ \obj -> do
-    awaitedSchemaName <- obj .: "schema_name"
-    awaitedSchemaVersion <- obj .: "schema_version"
     awaitedPayload <- obj .: "payload"
     pure AwaitedPayload {..}
 
 instance ToJSON AwaitedPayload where
   toJSON AwaitedPayload {..} =
     object
-      [ "schema_name" .= awaitedSchemaName,
-        "schema_version" .= awaitedSchemaVersion,
-        "payload" .= awaitedPayload
+      [ "payload" .= awaitedPayload
       ]
 
 -- | Errors specific to 'sessionAwaitResult'.  Distinct from
@@ -616,16 +603,14 @@ sessionLaunchAsync cfg options launch = do
 
 expectedResultObject :: ExpectedResultRequest -> Value
 expectedResultObject ExpectedResultRequest {..} =
-  object
-    ( concat
-        [ ["file_path" .= erFilePath],
-          maybeField "schema_name" erSchemaName,
-          maybeField "schema_version" erSchemaVersion,
-          maybeField "retry_prompt" erRetryPrompt,
-          maybeField "max_retries" erMaxRetries,
-          maybeField "payload_schema" erPayloadSchema
-        ]
-    )
+  object ["payload_schema" .= erPayloadSchema]
+
+-- | The result file agentd owns when it injects the result-protocol
+-- instruction.  Mirrors @doeff-agentd@'s @DEFAULT_RESULT_FILE@ — the
+-- launcher never names a path, so any client-side disk read (the legacy
+-- 'snapshotResult' path) uses this shared default.
+defaultResultFile :: FilePath
+defaultResultFile = ".agentd-result.json"
 
 maybeField :: ToJSON a => AesonKey.Key -> Maybe a -> [Pair]
 maybeField _ Nothing = []
@@ -760,8 +745,8 @@ snapshotResult snapshot =
                 resultFilePath = Nothing
               }
         )
-    Just expected -> do
-      let path = T.unpack (snapshotWorkDir snapshot) </> erFilePath expected
+    Just _expected -> do
+      let path = T.unpack (snapshotWorkDir snapshot) </> defaultResultFile
       exists <- doesFileExist path
       if not exists
         then
