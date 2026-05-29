@@ -149,7 +149,13 @@ data ExpectedResultRequest = ExpectedResultRequest
     erSchemaName :: Maybe Text,
     erSchemaVersion :: Maybe Int,
     erRetryPrompt :: Maybe Text,
-    erMaxRetries :: Maybe Int
+    erMaxRetries :: Maybe Int,
+    -- | Optional JSON-Schema (a constrained subset agentd understands)
+    -- the envelope's inner @payload@ object must satisfy.  Carried as a
+    -- raw 'Value' so this client stays agnostic to any particular
+    -- result shape — the launcher owns the schema, agentd just enforces
+    -- it and feeds violations back through the @retry_prompt@ loop.
+    erPayloadSchema :: Maybe Value
   }
   deriving stock (Eq, Show)
 
@@ -160,6 +166,7 @@ instance FromJSON ExpectedResultRequest where
     erSchemaVersion <- obj .:? "schema_version"
     erRetryPrompt <- obj .:? "retry_prompt"
     erMaxRetries <- obj .:? "max_retries"
+    erPayloadSchema <- obj .:? "payload_schema"
     pure ExpectedResultRequest {..}
 
 instance ToJSON ExpectedResultRequest where
@@ -615,7 +622,8 @@ expectedResultObject ExpectedResultRequest {..} =
           maybeField "schema_name" erSchemaName,
           maybeField "schema_version" erSchemaVersion,
           maybeField "retry_prompt" erRetryPrompt,
-          maybeField "max_retries" erMaxRetries
+          maybeField "max_retries" erMaxRetries,
+          maybeField "payload_schema" erPayloadSchema
         ]
     )
 
