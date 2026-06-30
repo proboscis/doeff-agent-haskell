@@ -27,6 +27,7 @@ module Doeff.Agentd.Client
     daemonStatus,
     defaultAgentdConfig,
     defaultAgentdWaitOptions,
+    ensureAgentdConfig,
     lifecycleText,
     parseLifecycle,
     parseSnapshot,
@@ -50,7 +51,7 @@ where
 import Control.Applicative ((<|>))
 import Control.Concurrent (threadDelay)
 import qualified Control.Concurrent.Async as Async
-import Control.Exception (Exception, IOException, bracket, try)
+import Control.Exception (Exception, IOException, bracket, displayException, try)
 import Data.Aeson
   ( FromJSON,
     ToJSON,
@@ -59,6 +60,7 @@ import Data.Aeson
     encode,
     eitherDecodeStrict,
     object,
+    withObject,
     (.:),
     (.:?),
     (.!=),
@@ -92,10 +94,12 @@ import Network.Socket
     socket,
   )
 import qualified Network.Socket.ByteString as Net
-import System.Directory (doesFileExist)
+import System.Directory (doesFileExist, findExecutable)
 import System.Environment (lookupEnv)
+import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Unsafe (unsafePerformIO)
+import System.Process (readProcessWithExitCode)
 import qualified System.Timeout as Timeout
 
 data AgentdConfig = AgentdConfig
@@ -104,6 +108,15 @@ data AgentdConfig = AgentdConfig
   }
   deriving stock (Eq, Show, Generic)
   deriving anyclass (FromJSON, ToJSON)
+
+newtype AgentdEnsureResponse = AgentdEnsureResponse
+  { ensureResponseSocketPath :: FilePath
+  }
+  deriving stock (Eq, Show)
+
+instance FromJSON AgentdEnsureResponse where
+  parseJSON = withObject "AgentdEnsureResponse" $ \obj ->
+    AgentdEnsureResponse <$> obj .: "socket_path"
 
 data AgentdError
   = AgentdSocketError String
@@ -311,6 +324,82 @@ defaultAgentdConfig = do
   where
     resolveUser (Just u) = u
     resolveUser Nothing = "unknown"
+
+ensureAgentdConfig :: IO (Either AgentdError AgentdConfig)
+ensureAgentdConfig = do
+  command <- resolveDoeffAgentsCommand
+  outcome <- try (readProcessWithExitCode command ["agentd", "ensure", "--json"] "")
+  case outcome of
+    Left (err :: IOException) ->
+      pure
+        ( Left
+            ( AgentdSocketError
+                ( "failed to run doeff-agents agentd ensure: "
+                    <> displayException err
+                )
+            )
+        )
+    Right (ExitSuccess, stdout, _stderr) ->
+      case eitherDecodeStrict (TE.encodeUtf8 (T.pack stdout)) of
+        Left err ->
+          pure
+            ( Left
+                ( AgentdProtocolError
+                    ( "doeff-agents agentd ensure returned invalid JSON: "
+                        <> err
+                    )
+                )
+            )
+        Right AgentdEnsureResponse {..} ->
+          pure
+            ( Right
+                AgentdConfig
+                  { agentdSocketPath = ensureResponseSocketPath,
+                    agentdReadBufferBytes = 65536
+                  }
+            )
+    Right (ExitFailure code, stdout, stderr) ->
+      pure
+        ( Left
+            ( AgentdSocketError
+                ( "doeff-agents agentd ensure failed with exit code "
+                    <> show code
+                    <> ": "
+                    <> firstNonEmpty stderr stdout
+                )
+            )
+        )
+  where
+    firstNonEmpty stderr stdout =
+      case T.unpack (T.strip (T.pack stderr)) of
+        "" -> T.unpack (T.strip (T.pack stdout))
+        msg -> msg
+
+resolveDoeffAgentsCommand :: IO FilePath
+resolveDoeffAgentsCommand = do
+  override <- lookupEnv "DOEFF_AGENTS_BIN"
+  case override of
+    Just command -> pure command
+    Nothing -> do
+      pathCommand <- findExecutable "doeff-agents"
+      case pathCommand of
+        Just command -> pure command
+        Nothing -> do
+          home <- lookupEnv "HOME"
+          candidate <- firstExisting (homeCandidates home)
+          pure (maybe "doeff-agents" id candidate)
+  where
+    homeCandidates Nothing = []
+    homeCandidates (Just home) =
+      [ home </> "repos" </> "doeff" </> ".venv" </> "bin" </> "doeff-agents"
+      ]
+
+    firstExisting [] = pure Nothing
+    firstExisting (candidate : rest) = do
+      exists <- doesFileExist candidate
+      if exists
+        then pure (Just candidate)
+        else firstExisting rest
 
 requestIdRef :: IORef Int
 requestIdRef = unsafePerformIO (newIORef 0)

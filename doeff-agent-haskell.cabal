@@ -33,6 +33,7 @@ library
       directory,
       filepath,
       network,
+      process,
       text,
       time,
       vector
