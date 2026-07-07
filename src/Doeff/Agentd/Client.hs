@@ -152,7 +152,16 @@ data LaunchRequest = LaunchRequest
     launchMcpServers :: Map Text Text,
     launchSkipTrustSetup :: Bool,
     launchLifecycle :: SessionLifecycle,
+    -- | Non-auth overlay environment only (ADR-DOE-AGENTS-004 R7).  Auth
+    -- and profile material (CODEX_HOME, CLAUDE_CONFIG_DIR, …) must ride
+    -- 'launchBinding'; the session host rejects binding-owned keys here.
     launchSessionEnv :: Map Text Text,
+    -- | Typed auth/profile binding — the serialized binding-time
+    -- configuration (kind-discriminated: @{"kind": "codex", "codex_home":
+    -- …}@ / @{"kind": "claude-code", "config_dir": …}@).  Carried as a raw
+    -- 'Value' so this client stays agnostic to the kind schemas; the
+    -- session host validates shape at admission.
+    launchBinding :: Maybe Value,
     launchExpectedResult :: Maybe ExpectedResultRequest
   }
   deriving stock (Eq, Show)
@@ -664,6 +673,9 @@ sessionLaunch cfg LaunchRequest {..} = do
             ["prompt" .= launchPrompt | not (T.null launchPrompt)],
             ["model" .= launchModel | not (T.null launchModel)],
             ["effort" .= launchEffort | not (T.null launchEffort)],
+            case launchBinding of
+              Nothing -> []
+              Just binding -> ["binding" .= binding],
             case launchExpectedResult of
               Nothing -> []
               Just spec -> ["expected_result" .= expectedResultObject spec]
