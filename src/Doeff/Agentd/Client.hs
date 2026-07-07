@@ -33,6 +33,7 @@ module Doeff.Agentd.Client
     parseSnapshot,
     pollRunResult,
     request,
+    resolveDoeffAgentsCommand,
     sessionAwaitResult,
     sessionCancel,
     sessionCapture,
