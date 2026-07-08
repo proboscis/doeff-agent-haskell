@@ -336,80 +336,91 @@ defaultAgentdConfig = do
     resolveUser Nothing = "unknown"
 
 ensureAgentdConfig :: IO (Either AgentdError AgentdConfig)
-ensureAgentdConfig = do
-  command <- resolveDoeffAgentsCommand
-  outcome <- try (readProcessWithExitCode command ["agentd", "ensure", "--json"] "")
-  case outcome of
-    Left (err :: IOException) ->
-      pure
-        ( Left
-            ( AgentdSocketError
-                ( "failed to run doeff-agents agentd ensure: "
-                    <> displayException err
-                )
-            )
-        )
-    Right (ExitSuccess, stdout, _stderr) ->
-      case eitherDecodeStrict (TE.encodeUtf8 (T.pack stdout)) of
-        Left err ->
+ensureAgentdConfig =
+  resolveDoeffAgentsCommand >>= \case
+    Left err -> pure (Left err)
+    Right command -> ensureWith command
+  where
+    ensureWith command = do
+      outcome <- try (readProcessWithExitCode command ["agentd", "ensure", "--json"] "")
+      case outcome of
+        Left (err :: IOException) ->
           pure
             ( Left
-                ( AgentdProtocolError
-                    ( "doeff-agents agentd ensure returned invalid JSON: "
-                        <> err
+                ( AgentdSocketError
+                    ( "failed to run doeff-agents agentd ensure: "
+                        <> displayException err
                     )
                 )
             )
-        Right AgentdEnsureResponse {..} ->
+        Right (ExitSuccess, stdout, _stderr) ->
+          case eitherDecodeStrict (TE.encodeUtf8 (T.pack stdout)) of
+            Left err ->
+              pure
+                ( Left
+                    ( AgentdProtocolError
+                        ( "doeff-agents agentd ensure returned invalid JSON: "
+                            <> err
+                        )
+                    )
+                )
+            Right AgentdEnsureResponse {..} ->
+              pure
+                ( Right
+                    AgentdConfig
+                      { agentdSocketPath = ensureResponseSocketPath,
+                        agentdReadBufferBytes = 65536
+                      }
+                )
+        Right (ExitFailure code, stdout, stderr) ->
           pure
-            ( Right
-                AgentdConfig
-                  { agentdSocketPath = ensureResponseSocketPath,
-                    agentdReadBufferBytes = 65536
-                  }
-            )
-    Right (ExitFailure code, stdout, stderr) ->
-      pure
-        ( Left
-            ( AgentdSocketError
-                ( "doeff-agents agentd ensure failed with exit code "
-                    <> show code
-                    <> ": "
-                    <> firstNonEmpty stderr stdout
+            ( Left
+                ( AgentdSocketError
+                    ( "doeff-agents agentd ensure failed with exit code "
+                        <> show code
+                        <> ": "
+                        <> firstNonEmpty stderr stdout
+                    )
                 )
             )
-        )
-  where
+
     firstNonEmpty stderr stdout =
       case T.unpack (T.strip (T.pack stderr)) of
         "" -> T.unpack (T.strip (T.pack stdout))
         msg -> msg
 
-resolveDoeffAgentsCommand :: IO FilePath
+-- | Resolve the @doeff-agents@ CLI: the explicit @DOEFF_AGENTS_BIN@ seam
+-- first, then @PATH@ — and nothing else.  The retired HOME-candidate
+-- fallback (@~\/repos\/doeff\/.venv\/bin\/doeff-agents@) silently resolved to
+-- a stale main-branch binary under launchd (whose default @PATH@ lacks
+-- @~\/.local\/bin@), which both masked every kinds fetch and pointed the
+-- ensure\/spawn path at a version-skewed host.  A set-but-missing
+-- @DOEFF_AGENTS_BIN@ fails loud rather than falling through to @PATH@:
+-- the seam exists to pin the executable identity, and masking a broken
+-- pin with a differently-versioned @PATH@ hit is the same silent skew.
+resolveDoeffAgentsCommand :: IO (Either AgentdError FilePath)
 resolveDoeffAgentsCommand = do
   override <- lookupEnv "DOEFF_AGENTS_BIN"
   case override of
-    Just command -> pure command
+    Just command -> do
+      exists <- doesFileExist command
+      pure $
+        if exists
+          then Right command
+          else
+            Left
+              ( AgentdSocketError
+                  ("DOEFF_AGENTS_BIN is set but does not exist: " <> command)
+              )
     Nothing -> do
       pathCommand <- findExecutable "doeff-agents"
-      case pathCommand of
-        Just command -> pure command
-        Nothing -> do
-          home <- lookupEnv "HOME"
-          candidate <- firstExisting (homeCandidates home)
-          pure (maybe "doeff-agents" id candidate)
-  where
-    homeCandidates Nothing = []
-    homeCandidates (Just home) =
-      [ home </> "repos" </> "doeff" </> ".venv" </> "bin" </> "doeff-agents"
-      ]
-
-    firstExisting [] = pure Nothing
-    firstExisting (candidate : rest) = do
-      exists <- doesFileExist candidate
-      if exists
-        then pure (Just candidate)
-        else firstExisting rest
+      pure $ case pathCommand of
+        Just command -> Right command
+        Nothing ->
+          Left
+            ( AgentdSocketError
+                "doeff-agents not found: set DOEFF_AGENTS_BIN or put doeff-agents on PATH (the silent HOME fallback is retired)"
+            )
 
 requestIdRef :: IORef Int
 requestIdRef = unsafePerformIO (newIORef 0)
