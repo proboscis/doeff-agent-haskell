@@ -6,7 +6,8 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
 module Doeff.Agentd.Client
-  ( AgentdConfig (..),
+  ( AgentdCallError (..),
+    AgentdConfig (..),
     AgentdError (..),
     AgentdFinalResult (..),
     AgentdResult (..),
@@ -20,6 +21,7 @@ module Doeff.Agentd.Client
     AwaitedResult (..),
     ExpectedResultRequest (..),
     LaunchRequest (..),
+    ResumeRequest (..),
     SessionLifecycle (..),
     agentdRunSessionId,
     awaitResult,
@@ -43,6 +45,7 @@ module Doeff.Agentd.Client
     sessionLaunchAsync,
     sessionList,
     sessionPollResult,
+    sessionResume,
     sessionSend,
     sessionWaitResult,
     tryParseRfc3339,
@@ -167,6 +170,40 @@ data LaunchRequest = LaunchRequest
   }
   deriving stock (Eq, Show)
 
+-- | Wire request for @session.resume@ (ADR-DOE-AGENTS-006 R4).  The source
+-- session id names the terminal predecessor row; everything else is
+-- optional and falls back to the session host's own derivation (overlay
+-- restore from the source row).  'resumeBinding' / 'resumeNewSessionId' /
+-- 'resumeExpectedResult' are the cross-binding failover extensions: a
+-- different auth binding re-homes the incarnation (the session host owns
+-- the transcript transplant), the caller-minted session id keeps the
+-- launcher's id conventions, and an explicit result contract takes
+-- precedence over the carried unfulfilled one.  Empty 'Text' / empty 'Map'
+-- fields are omitted from the wire so the session host's restore-from-source
+-- semantics apply (an explicit empty map would read as an override).
+data ResumeRequest = ResumeRequest
+  { resumeSourceSessionId :: Text,
+    resumeNewSessionId :: Text,
+    resumePrompt :: Text,
+    resumeModel :: Text,
+    resumeEffort :: Text,
+    resumeMcpServers :: Map Text Text,
+    resumeSessionEnv :: Map Text Text,
+    resumeBinding :: Maybe Value,
+    resumeExpectedResult :: Maybe ExpectedResultRequest
+  }
+  deriving stock (Eq, Show)
+
+-- | Error surface for calls that must keep the server's error code
+-- distinguishable ('request' collapses code + message into one string).
+-- @callErrorCode@ carries the agentd-side @error_code@ verbatim (an Int or
+-- a Text on the wire, hence 'Value'); 'Nothing' when the server sent none.
+data AgentdCallError
+  = CallSocketError String
+  | CallProtocolError String
+  | CallServerError {callErrorCode :: Maybe Value, callErrorMessage :: String}
+  deriving stock (Eq, Show, Generic)
+
 -- | The result contract the launcher attaches to a launch.  Mirrors
 -- @doeff-agentd@'s @ExpectedResultSpec@: the launcher supplies ONLY the
 -- JSON-Schema (a constrained subset agentd understands) the agent's
@@ -243,7 +280,17 @@ data AgentdSnapshot = AgentdSnapshot
     snapshotPrUrl :: Maybe Text,
     snapshotOutputSnippet :: Maybe Text,
     snapshotTerminalCause :: Maybe AgentdTerminalCause,
-    snapshotExpectedResult :: Maybe ExpectedResultRequest
+    snapshotExpectedResult :: Maybe ExpectedResultRequest,
+    -- | ADR-DOE-AGENTS-006 conversation lineage, decoded verbatim off the
+    -- wire.  'snapshotConversation' is the kind-discriminated durable
+    -- conversation identity (claude @{"session_id": …}@ / codex
+    -- @{"session_id": …, "rollout_path": …}@) carried as an opaque
+    -- 'Value' — the client does not interpret kind schemas.  All four are
+    -- optional so snapshots from a pre-lineage session host keep decoding.
+    snapshotConversation :: Maybe Value,
+    snapshotGeneration :: Maybe Int,
+    snapshotResumedFromSessionId :: Maybe Text,
+    snapshotForkedFromSessionId :: Maybe Text
   }
   deriving stock (Eq, Show, Generic)
 
@@ -312,7 +359,11 @@ instance ToJSON AgentdSnapshot where
             maybeField "pr_url" snapshotPrUrl,
             maybeField "output_snippet" snapshotOutputSnippet,
             maybeField "terminal_cause" snapshotTerminalCause,
-            maybeField "expected_result" snapshotExpectedResult
+            maybeField "expected_result" snapshotExpectedResult,
+            maybeField "conversation" snapshotConversation,
+            maybeField "generation" snapshotGeneration,
+            maybeField "resumed_from_session_id" snapshotResumedFromSessionId,
+            maybeField "forked_from_session_id" snapshotForkedFromSessionId
           ]
       )
 
@@ -695,6 +746,100 @@ sessionLaunch cfg LaunchRequest {..} = do
       params = object (baseFields ++ maybeFields)
   fmap (>>= parseSnapshot) (request cfg "session.launch" params)
 
+-- | @session.resume@: start a new incarnation of a terminal session's
+-- conversation (ADR-DOE-AGENTS-006 R4).  Uses the code-preserving
+-- transport so callers can classify typed rejects (one-live-incarnation,
+-- identity-unknown, transcript-not-discoverable) without substring
+-- matching once the session host stamps @error_code@; the verbatim
+-- message is always available as the fallback classifier.  The unix
+-- socket read blocks without a deadline — resume goes through the same
+-- REPL-ready gate as launch, so a short client timeout would disconnect
+-- mid-boot.
+sessionResume :: AgentdConfig -> ResumeRequest -> IO (Either AgentdCallError AgentdSnapshot)
+sessionResume cfg ResumeRequest {..} = do
+  let baseFields = ["session_id" .= resumeSourceSessionId]
+      maybeFields =
+        concat
+          [ ["new_session_id" .= resumeNewSessionId | not (T.null resumeNewSessionId)],
+            ["prompt" .= resumePrompt | not (T.null resumePrompt)],
+            ["model" .= resumeModel | not (T.null resumeModel)],
+            ["effort" .= resumeEffort | not (T.null resumeEffort)],
+            ["mcp_servers" .= resumeMcpServers | not (Map.null resumeMcpServers)],
+            ["session_env" .= resumeSessionEnv | not (Map.null resumeSessionEnv)],
+            case resumeBinding of
+              Nothing -> []
+              Just binding -> ["binding" .= binding],
+            case resumeExpectedResult of
+              Nothing -> []
+              Just spec -> ["expected_result" .= expectedResultObject spec]
+          ]
+      params = object (baseFields ++ maybeFields)
+  outcome <- requestWithCode cfg "session.resume" params
+  pure (outcome >>= parseSnapshotWithCode)
+  where
+    parseSnapshotWithCode value = case parseSnapshot value of
+      Left (AgentdProtocolError err) -> Left (CallProtocolError err)
+      Left err -> Left (CallProtocolError (show err))
+      Right snapshot -> Right snapshot
+
+-- | 'request' variant that keeps the JSON-RPC @error_code@ (the generic
+-- helper collapses code + message into one string).
+requestWithCode :: AgentdConfig -> Text -> Value -> IO (Either AgentdCallError Value)
+requestWithCode AgentdConfig {..} method params = do
+  rid <- nextRequestId
+  let payload =
+        object
+          [ "id" .= rid,
+            "method" .= method,
+            "params" .= params
+          ]
+      encoded = LBS.toStrict (encode payload) <> "\n"
+  socketResult <-
+    try $ bracket openSock close $ \sock -> do
+      Net.sendAll sock encoded
+      readLine sock agentdReadBufferBytes mempty
+  case socketResult of
+    Left (err :: IOException) ->
+      pure (Left (CallSocketError (show err)))
+    Right rawLine -> pure (decodeResponseWithCode rid rawLine)
+  where
+    openSock = do
+      s <- socket AF_UNIX Stream 0
+      connect s (SockAddrUnix agentdSocketPath)
+      pure s
+
+decodeResponseWithCode :: Int -> BS.ByteString -> Either AgentdCallError Value
+decodeResponseWithCode expectedId rawLine =
+  case decodeStrict rawLine :: Maybe Value of
+    Nothing ->
+      Left (CallProtocolError ("invalid JSON response: " <> BSC.unpack rawLine))
+    Just (Object obj) ->
+      case parseEither (parseResponseWithCode expectedId) (Object obj) of
+        Left err -> Left (CallProtocolError err)
+        Right outcome -> outcome
+    Just _ ->
+      Left (CallProtocolError "agentd returned a non-object response")
+
+parseResponseWithCode :: Int -> Value -> Parser (Either AgentdCallError Value)
+parseResponseWithCode expectedId = Aeson.withObject "AgentdResponse" $ \obj -> do
+  rid <- obj .: "id"
+  ok <- obj .: "ok"
+  result <- obj .:? "result"
+  err <- obj .:? "error"
+  errCode <- obj .:? "error_code"
+  if rid /= expectedId
+    then pure (Left (CallProtocolError "response id did not match request id"))
+    else
+      if ok
+        then case result of
+          Just value -> pure (Right value)
+          Nothing -> pure (Right Null)
+        else
+          let message = case (err :: Maybe Text) of
+                Just msg | not (T.null msg) -> T.unpack msg
+                _ -> "agentd request failed"
+           in pure (Left (CallServerError errCode message))
+
 sessionLaunchAsync ::
   AgentdConfig ->
   AgentdWaitOptions ->
@@ -943,6 +1088,10 @@ snapshotParser = Aeson.withObject "AgentdSnapshot" $ \obj -> do
   snapshotOutputSnippet <- obj .:? "output_snippet"
   snapshotTerminalCause <- obj .:? "terminal_cause"
   snapshotExpectedResult <- obj .:? "expected_result"
+  snapshotConversation <- obj .:? "conversation"
+  snapshotGeneration <- obj .:? "generation"
+  snapshotResumedFromSessionId <- obj .:? "resumed_from_session_id"
+  snapshotForkedFromSessionId <- obj .:? "forked_from_session_id"
   pure AgentdSnapshot {..}
 
 parseSnapshotList :: Value -> Either AgentdError [AgentdSnapshot]
