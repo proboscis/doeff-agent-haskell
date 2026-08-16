@@ -190,6 +190,22 @@ data ResumeRequest = ResumeRequest
     resumeMcpServers :: Map Text Text,
     resumeSessionEnv :: Map Text Text,
     resumeBinding :: Maybe Value,
+    -- | The directory the resumed incarnation must run in
+    -- (ADR-DOE-AGENTS-006 R10).  Empty = keep the session host's default,
+    -- which is the PREDECESSOR's work dir.
+    --
+    -- That default was written on the assumption that the predecessor's
+    -- directory outlives the conversation, because the CLI indexes
+    -- conversations by cwd.  Production falsified it: the launcher reaps
+    -- a workspace when its invocation is reaped, so the resume asked tmux
+    -- for a directory that no longer existed — and @tmux new-session -c@
+    -- SILENTLY falls back to @$HOME@.  The incarnation then started in the
+    -- wrong directory and could never find the transplanted transcript
+    -- (measured 2026-08-16: 43 of 43 resumes died this way, each burning
+    -- the 120 s launch-ready gate first).  A caller that allocates a fresh
+    -- workspace names it here; the session host moves the transcript to
+    -- match and rejects loudly when the directory is absent.
+    resumeWorkDir :: Text,
     resumeExpectedResult :: Maybe ExpectedResultRequest
   }
   deriving stock (Eq, Show)
@@ -766,6 +782,7 @@ sessionResume cfg ResumeRequest {..} = do
             ["effort" .= resumeEffort | not (T.null resumeEffort)],
             ["mcp_servers" .= resumeMcpServers | not (Map.null resumeMcpServers)],
             ["session_env" .= resumeSessionEnv | not (Map.null resumeSessionEnv)],
+            ["work_dir" .= resumeWorkDir | not (T.null resumeWorkDir)],
             case resumeBinding of
               Nothing -> []
               Just binding -> ["binding" .= binding],
