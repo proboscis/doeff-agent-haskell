@@ -175,7 +175,15 @@ data LaunchRequest = LaunchRequest
     -- launcher-side writes break when launcher and session host are
     -- different machines (the ACP `.acp-context.json` seam, 2026-08-20).
     -- The host constrains @contextFilePath@ to a bare file name.
-    launchContextFile :: Maybe ContextFileRequest
+    launchContextFile :: Maybe ContextFileRequest,
+    -- | Optional workspace directive (ACP W2, law
+    -- resolved-materialization): the launcher DECIDES the worktree shape
+    -- as data (dir / repo / branch-or-detach / pin sha / owner marker)
+    -- and the session host MATERIALIZES it (git worktree add) before its
+    -- work-dir validation — the launcher's machine has no namespace
+    -- repos, so the worktree can only exist where the session runs.
+    -- Carried as a raw 'Value': the host owns admission of the shape.
+    launchWorkspaceSeed :: Maybe Value
   }
   deriving stock (Eq, Show)
 
@@ -786,7 +794,10 @@ sessionLaunch cfg LaunchRequest {..} = do
               Just spec -> ["expected_result" .= expectedResultObject spec],
             case launchContextFile of
               Nothing -> []
-              Just ctx -> ["context_file" .= ctx]
+              Just ctx -> ["context_file" .= ctx],
+            case launchWorkspaceSeed of
+              Nothing -> []
+              Just seed -> ["workspace_seed" .= seed]
           ]
       params = object (baseFields ++ maybeFields)
   fmap (>>= parseSnapshot) (request cfg "session.launch" params)
