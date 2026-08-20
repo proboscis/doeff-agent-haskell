@@ -19,6 +19,7 @@ module Doeff.Agentd.Client
     AwaitError (..),
     AwaitedPayload (..),
     AwaitedResult (..),
+    ContextFileRequest (..),
     ExpectedResultRequest (..),
     LaunchRequest (..),
     ResumeRequest (..),
@@ -166,9 +167,34 @@ data LaunchRequest = LaunchRequest
     -- 'Value' so this client stays agnostic to the kind schemas; the
     -- session host validates shape at admission.
     launchBinding :: Maybe Value,
-    launchExpectedResult :: Maybe ExpectedResultRequest
+    launchExpectedResult :: Maybe ExpectedResultRequest,
+    -- | Optional file the session host must materialize inside
+    -- 'launchWorkDir' BEFORE spawning the session (after its own
+    -- work-dir existence validation).  Carried on the wire so the
+    -- write happens on the machine the session actually runs on —
+    -- launcher-side writes break when launcher and session host are
+    -- different machines (the ACP `.acp-context.json` seam, 2026-08-20).
+    -- The host constrains @contextFilePath@ to a bare file name.
+    launchContextFile :: Maybe ContextFileRequest
   }
   deriving stock (Eq, Show)
+
+-- | Wire shape for @context_file@ on @session.launch@: a single file
+-- (bare name + arbitrary JSON content) the session host writes into the
+-- work dir before spawn.  The client stays agnostic to the content
+-- schema and to any particular file-name convention.
+data ContextFileRequest = ContextFileRequest
+  { contextFilePath :: Text,
+    contextFileContent :: Value
+  }
+  deriving stock (Eq, Show)
+
+instance ToJSON ContextFileRequest where
+  toJSON ContextFileRequest {..} =
+    object
+      [ "path" .= contextFilePath,
+        "content" .= contextFileContent
+      ]
 
 -- | Wire request for @session.resume@ (ADR-DOE-AGENTS-006 R4).  The source
 -- session id names the terminal predecessor row; everything else is
@@ -757,7 +783,10 @@ sessionLaunch cfg LaunchRequest {..} = do
               Just binding -> ["binding" .= binding],
             case launchExpectedResult of
               Nothing -> []
-              Just spec -> ["expected_result" .= expectedResultObject spec]
+              Just spec -> ["expected_result" .= expectedResultObject spec],
+            case launchContextFile of
+              Nothing -> []
+              Just ctx -> ["context_file" .= ctx]
           ]
       params = object (baseFields ++ maybeFields)
   fmap (>>= parseSnapshot) (request cfg "session.launch" params)
