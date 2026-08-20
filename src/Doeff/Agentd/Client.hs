@@ -240,7 +240,13 @@ data ResumeRequest = ResumeRequest
     -- workspace names it here; the session host moves the transcript to
     -- match and rejects loudly when the directory is absent.
     resumeWorkDir :: Text,
-    resumeExpectedResult :: Maybe ExpectedResultRequest
+    resumeExpectedResult :: Maybe ExpectedResultRequest,
+    -- | @context_file@ on @session.resume@ (law context-file-rides-the-wire,
+    -- resume face): the fresh invocation's context memo rides the wire and
+    -- the session host materializes it into the incarnation's hosting
+    -- directory before spawn.  Same wire shape and host admission as the
+    -- launch face; 'Nothing' omits the field (older hosts never see it).
+    resumeContextFile :: Maybe ContextFileRequest
   }
   deriving stock (Eq, Show)
 
@@ -828,7 +834,10 @@ sessionResume cfg ResumeRequest {..} = do
               Just binding -> ["binding" .= binding],
             case resumeExpectedResult of
               Nothing -> []
-              Just spec -> ["expected_result" .= expectedResultObject spec]
+              Just spec -> ["expected_result" .= expectedResultObject spec],
+            case resumeContextFile of
+              Nothing -> []
+              Just ctx -> ["context_file" .= ctx]
           ]
       params = object (baseFields ++ maybeFields)
   outcome <- requestWithCode cfg "session.resume" params
