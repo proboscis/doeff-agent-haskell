@@ -48,9 +48,12 @@ test-suite doeff-agent-haskell-test
       LambdaCase
       OverloadedStrings
   build-depends:
+      aeson,
       base,
+      containers,
       directory,
       doeff-agent-haskell,
       filepath,
       hspec,
-      temporary
+      temporary,
+      text

@@ -31,8 +31,10 @@ module Doeff.Agentd.Client
     defaultAgentdConfig,
     defaultAgentdWaitOptions,
     ensureAgentdConfig,
+    launchRequestParams,
     lifecycleText,
     parseLifecycle,
+    resumeRequestParams,
     parseSnapshot,
     pollRunResult,
     request,
@@ -183,7 +185,17 @@ data LaunchRequest = LaunchRequest
     -- work-dir validation — the launcher's machine has no namespace
     -- repos, so the worktree can only exist where the session runs.
     -- Carried as a raw 'Value': the host owns admission of the shape.
-    launchWorkspaceSeed :: Maybe Value
+    launchWorkspaceSeed :: Maybe Value,
+    -- | Optional attribution metadata: WHO this launch works for, as the
+    -- launcher's opaque ids (the ACP scheduler sends
+    -- @{work_item_id, invocation_id, action_id, resource_key, namespace}@).
+    -- The session host stores it verbatim on the session row and never
+    -- interprets it — the consumer is the Mac-side usage/attribution
+    -- ledger joining spend to the function that spent it.  'Nothing'
+    -- stays off the wire, so hosts predating the field never see it
+    -- (same additive shape as 'launchContextFile' /
+    -- 'launchWorkspaceSeed').
+    launchAttribution :: Maybe Value
   }
   deriving stock (Eq, Show)
 
@@ -246,7 +258,13 @@ data ResumeRequest = ResumeRequest
     -- the session host materializes it into the incarnation's hosting
     -- directory before spawn.  Same wire shape and host admission as the
     -- launch face; 'Nothing' omits the field (older hosts never see it).
-    resumeContextFile :: Maybe ContextFileRequest
+    resumeContextFile :: Maybe ContextFileRequest,
+    -- | Attribution metadata for the NEW incarnation (one law, both
+    -- faces — see 'launchAttribution').  A resumed incarnation hosts a
+    -- fresh invocation, so its attribution must travel the resume verb
+    -- too; leaving it off would silently break the spend→function join
+    -- exactly on the failover lane.  'Nothing' omits the field.
+    resumeAttribution :: Maybe Value
   }
   deriving stock (Eq, Show)
 
@@ -774,8 +792,12 @@ parseAwaitResponse expectedId = Aeson.withObject "AwaitedResponse" $ \obj -> do
 daemonStatus :: AgentdConfig -> IO (Either AgentdError Value)
 daemonStatus cfg = request cfg "daemon.status" (object [])
 
-sessionLaunch :: AgentdConfig -> LaunchRequest -> IO (Either AgentdError AgentdSnapshot)
-sessionLaunch cfg LaunchRequest {..} = do
+-- | The @session.launch@ params object, extracted pure so the
+-- request↔wire mapping is testable without a socket: every optional
+-- field's absence-stays-off-the-wire behaviour (old hosts never see a
+-- field the caller did not set) is pinned against THIS function.
+launchRequestParams :: LaunchRequest -> Value
+launchRequestParams LaunchRequest {..} =
   let baseFields =
         [ "session_id" .= launchSessionId,
           "session_name" .= launchSessionName,
@@ -803,10 +825,16 @@ sessionLaunch cfg LaunchRequest {..} = do
               Just ctx -> ["context_file" .= ctx],
             case launchWorkspaceSeed of
               Nothing -> []
-              Just seed -> ["workspace_seed" .= seed]
+              Just seed -> ["workspace_seed" .= seed],
+            case launchAttribution of
+              Nothing -> []
+              Just attribution -> ["launch_attribution" .= attribution]
           ]
-      params = object (baseFields ++ maybeFields)
-  fmap (>>= parseSnapshot) (request cfg "session.launch" params)
+   in object (baseFields ++ maybeFields)
+
+sessionLaunch :: AgentdConfig -> LaunchRequest -> IO (Either AgentdError AgentdSnapshot)
+sessionLaunch cfg launch =
+  fmap (>>= parseSnapshot) (request cfg "session.launch" (launchRequestParams launch))
 
 -- | @session.resume@: start a new incarnation of a terminal session's
 -- conversation (ADR-DOE-AGENTS-006 R4).  Uses the code-preserving
@@ -817,8 +845,11 @@ sessionLaunch cfg LaunchRequest {..} = do
 -- socket read blocks without a deadline — resume goes through the same
 -- REPL-ready gate as launch, so a short client timeout would disconnect
 -- mid-boot.
-sessionResume :: AgentdConfig -> ResumeRequest -> IO (Either AgentdCallError AgentdSnapshot)
-sessionResume cfg ResumeRequest {..} = do
+-- | The @session.resume@ params object, extracted pure for the same
+-- reason as 'launchRequestParams': the absence-stays-off-the-wire
+-- behaviour of every optional field is pinned against this function.
+resumeRequestParams :: ResumeRequest -> Value
+resumeRequestParams ResumeRequest {..} =
   let baseFields = ["session_id" .= resumeSourceSessionId]
       maybeFields =
         concat
@@ -837,10 +868,16 @@ sessionResume cfg ResumeRequest {..} = do
               Just spec -> ["expected_result" .= expectedResultObject spec],
             case resumeContextFile of
               Nothing -> []
-              Just ctx -> ["context_file" .= ctx]
+              Just ctx -> ["context_file" .= ctx],
+            case resumeAttribution of
+              Nothing -> []
+              Just attribution -> ["launch_attribution" .= attribution]
           ]
-      params = object (baseFields ++ maybeFields)
-  outcome <- requestWithCode cfg "session.resume" params
+   in object (baseFields ++ maybeFields)
+
+sessionResume :: AgentdConfig -> ResumeRequest -> IO (Either AgentdCallError AgentdSnapshot)
+sessionResume cfg resume = do
+  outcome <- requestWithCode cfg "session.resume" (resumeRequestParams resume)
   pure (outcome >>= parseSnapshotWithCode)
   where
     parseSnapshotWithCode value = case parseSnapshot value of
