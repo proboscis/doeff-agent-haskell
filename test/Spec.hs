@@ -6,10 +6,27 @@
 -- fallback.  The retired HOME candidate silently resolved to a stale
 -- main-branch binary under launchd and masked a never-succeeding fetch
 -- while keeping ensure/spawn on a version-skewed host.
+--
+-- Also pins the pure wire-params builders ('launchRequestParams' /
+-- 'resumeRequestParams'): an optional field the caller did not set stays
+-- OFF the wire, so a session host predating the field never sees it —
+-- the additive-evolution contract every @Maybe@ field relies on.
 module Main (main) where
 
 import Control.Exception (bracket)
-import Doeff.Agentd.Client (AgentdError (..), resolveDoeffAgentsCommand)
+import Data.Aeson (Value (Object), object, (.=))
+import qualified Data.Aeson.KeyMap as KeyMap
+import qualified Data.Map.Strict as Map
+import Data.Text (Text)
+import Doeff.Agentd.Client
+  ( AgentdError (..),
+    LaunchRequest (..),
+    ResumeRequest (..),
+    SessionLifecycle (LifecycleRunToCompletion),
+    launchRequestParams,
+    resolveDoeffAgentsCommand,
+    resumeRequestParams,
+  )
 import System.Directory
   ( createDirectory,
     getPermissions,
@@ -49,8 +66,103 @@ plantFakeAgents dir = do
   setPermissions path (setOwnerExecutable True perms)
   pure path
 
+-- | Minimal launch request: every optional field unset.  What this
+-- produces on the wire is exactly what a pre-extension host receives.
+minimalLaunchRequest :: LaunchRequest
+minimalLaunchRequest =
+  LaunchRequest
+    { launchSessionId = "sid-1",
+      launchSessionName = "name-1",
+      launchAgentType = "claude",
+      launchWorkDir = "/tmp/w",
+      launchCommand = "",
+      launchPrompt = "",
+      launchModel = "",
+      launchEffort = "",
+      launchMcpServers = Map.empty,
+      launchSkipTrustSetup = False,
+      launchLifecycle = LifecycleRunToCompletion,
+      launchSessionEnv = Map.empty,
+      launchBinding = Nothing,
+      launchExpectedResult = Nothing,
+      launchContextFile = Nothing,
+      launchWorkspaceSeed = Nothing,
+      launchAttribution = Nothing
+    }
+
+-- | Minimal resume request, same idea.
+minimalResumeRequest :: ResumeRequest
+minimalResumeRequest =
+  ResumeRequest
+    { resumeSourceSessionId = "sid-src",
+      resumeNewSessionId = "",
+      resumePrompt = "",
+      resumeModel = "",
+      resumeEffort = "",
+      resumeMcpServers = Map.empty,
+      resumeSessionEnv = Map.empty,
+      resumeBinding = Nothing,
+      resumeWorkDir = "",
+      resumeExpectedResult = Nothing,
+      resumeContextFile = Nothing,
+      resumeAttribution = Nothing
+    }
+
+-- | The example attribution object the ACP scheduler sends: opaque to
+-- this client and to the session host — carried verbatim.
+attributionFixture :: Value
+attributionFixture =
+  object
+    [ "work_item_id" .= ("wi_attr" :: Text),
+      "invocation_id" .= ("inv_wi_attr_a1" :: Text),
+      "action_id" .= ("argus-sensor-run" :: Text),
+      "resource_key" .= ("default:agent-responsibility:argus-loop" :: Text),
+      "namespace" .= ("default" :: Text)
+    ]
+
+paramsFields :: Value -> KeyMap.KeyMap Value
+paramsFields = \case
+  Object fields -> fields
+  other -> error ("wire params must be a JSON object, got: " <> show other)
+
 spec :: Spec
-spec = describe "resolveDoeffAgentsCommand" $ do
+spec = do
+  wireParamsSpec
+  resolverSpec
+
+wireParamsSpec :: Spec
+wireParamsSpec = do
+  describe "launchRequestParams (session.launch wire params)" $ do
+    it "keeps launch_attribution OFF the wire when the caller did not set it" $
+      -- The additive contract: a host predating the field must receive
+      -- byte-identical params from an unchanged caller.
+      KeyMap.member "launch_attribution" (paramsFields (launchRequestParams minimalLaunchRequest))
+        `shouldBe` False
+
+    it "carries launch_attribution verbatim when set — the client never interprets it" $ do
+      let params =
+            launchRequestParams
+              minimalLaunchRequest {launchAttribution = Just attributionFixture}
+      KeyMap.lookup "launch_attribution" (paramsFields params)
+        `shouldBe` Just attributionFixture
+
+  describe "resumeRequestParams (session.resume wire params)" $ do
+    it "keeps launch_attribution OFF the wire when the caller did not set it" $
+      KeyMap.member "launch_attribution" (paramsFields (resumeRequestParams minimalResumeRequest))
+        `shouldBe` False
+
+    it "carries launch_attribution verbatim on the resume face too — one law, both faces" $ do
+      -- A resumed incarnation hosts a fresh invocation; dropping the
+      -- attribution on this verb would break the spend→function join
+      -- exactly on the failover lane.
+      let params =
+            resumeRequestParams
+              minimalResumeRequest {resumeAttribution = Just attributionFixture}
+      KeyMap.lookup "launch_attribution" (paramsFields params)
+        `shouldBe` Just attributionFixture
+
+resolverSpec :: Spec
+resolverSpec = describe "resolveDoeffAgentsCommand" $ do
   it "resolves an existing DOEFF_AGENTS_BIN verbatim" $
     withSystemTempDirectory "doeff-agents-test" $ \dir -> do
       fake <- plantFakeAgents dir
