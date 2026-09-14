@@ -6,6 +6,8 @@ license: MIT
 author: s22625
 maintainer: s22625
 build-type: Simple
+extra-source-files:
+    test/fixtures/*.json
 
 common warnings
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wpartial-fields

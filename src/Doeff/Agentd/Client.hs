@@ -346,7 +346,14 @@ data AgentdSnapshot = AgentdSnapshot
     snapshotLifecycle :: Text,
     snapshotStatus :: Text,
     snapshotBackendKind :: Text,
-    snapshotBackendRef :: Map Text Text,
+    -- | The backend's own locator for the session, decoded verbatim off
+    -- the wire as the opaque JSON object the session host sent.  Its
+    -- shape is per-backend — tmux carries @{"session_name", "pane_id",
+    -- "command"}@ strings, headless carries @{"session_name", "pid",
+    -- "events_path", "argv", "socket_path"}@ with an integer @pid@ and an
+    -- array @argv@ — so the values stay 'Value' and are never narrowed to
+    -- 'Text' (a 'Text' map rejected every headless launch reply).
+    snapshotBackendRef :: Map Text Value,
     snapshotStartedAt :: Text,
     snapshotLastObservedAt :: Maybe Text,
     snapshotFinishedAt :: Maybe Text,

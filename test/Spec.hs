@@ -11,19 +11,32 @@
 -- 'resumeRequestParams'): an optional field the caller did not set stays
 -- OFF the wire, so a session host predating the field never sees it —
 -- the additive-evolution contract every @Maybe@ field relies on.
+--
+-- And pins 'parseSnapshot' against real @session.launch@ replies captured
+-- off a live session host (test/fixtures): the headless backend answers
+-- @backend_ref@ with an integer @pid@ and an array @argv@, which the old
+-- @Map Text Text@ field rejected, failing every headless launch.
 module Main (main) where
 
 import Control.Exception (bracket)
-import Data.Aeson (Value (Object), object, (.=))
+import Data.Aeson
+  ( Value (Array, Bool, Number, Object, String),
+    eitherDecodeFileStrict,
+    object,
+    toJSON,
+    (.=),
+  )
 import qualified Data.Aeson.KeyMap as KeyMap
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Doeff.Agentd.Client
   ( AgentdError (..),
+    AgentdSnapshot (..),
     LaunchRequest (..),
     ResumeRequest (..),
     SessionLifecycle (LifecycleRunToCompletion),
     launchRequestParams,
+    parseSnapshot,
     resolveDoeffAgentsCommand,
     resumeRequestParams,
   )
@@ -128,7 +141,65 @@ paramsFields = \case
 spec :: Spec
 spec = do
   wireParamsSpec
+  launchReplySpec
   resolverSpec
+
+-- | A captured @session.launch@ reply line: @{"id", "ok", "result"}@.
+-- Returns the @result@ (the snapshot) after checking the host said ok.
+loadLaunchReply :: FilePath -> IO Value
+loadLaunchReply path =
+  eitherDecodeFileStrict path >>= \case
+    Left err -> fail ("fixture " <> path <> " is not JSON: " <> err)
+    Right envelope -> case KeyMap.lookup "ok" (paramsFields envelope) of
+      Just (Bool True) -> case KeyMap.lookup "result" (paramsFields envelope) of
+        Just result -> pure result
+        Nothing -> fail ("fixture " <> path <> " has no result")
+      other -> fail ("fixture " <> path <> " is not an ok reply: " <> show other)
+
+-- | Parse a captured reply's snapshot, failing the spec on a parse error.
+parseReply :: Value -> IO AgentdSnapshot
+parseReply result = case parseSnapshot result of
+  Right snapshot -> pure snapshot
+  Left err -> expectationFailure ("parseSnapshot failed: " <> show err) >> fail "unreachable"
+
+headlessReplyFixture :: FilePath
+headlessReplyFixture = "test/fixtures/session-launch-headless.json"
+
+tmuxReplyFixture :: FilePath
+tmuxReplyFixture = "test/fixtures/session-launch-tmux.json"
+
+launchReplySpec :: Spec
+launchReplySpec = describe "parseSnapshot (captured session.launch replies)" $ do
+  it "parses the headless reply, keeping argv as an array and pid as a number" $ do
+    result <- loadLaunchReply headlessReplyFixture
+    snapshot <- parseReply result
+    snapshotBackendKind snapshot `shouldBe` "headless"
+    let ref = snapshotBackendRef snapshot
+    Map.lookup "argv" ref `shouldSatisfy` \case
+      Just (Array _) -> True
+      _ -> False
+    Map.lookup "pid" ref `shouldBe` Just (Number 68393)
+    Map.lookup "session_name" ref `shouldBe` Just (String "dahcap-headless-1")
+
+  it "parses the tmux reply as before: every backend_ref value is the string the host sent" $ do
+    snapshot <- loadLaunchReply tmuxReplyFixture >>= parseReply
+    snapshotBackendKind snapshot `shouldBe` "tmux"
+    snapshotBackendRef snapshot
+      `shouldBe` Map.fromList
+        [ ("command", String "/tmp/dahcap/stub/claude"),
+          ("pane_id", String "%0"),
+          ("session_name", String "dahcap-tmux-1")
+        ]
+
+  it "writes backend_ref back verbatim for both backends — nothing dropped or stringified" $
+    mapM_
+      ( \path -> do
+          result <- loadLaunchReply path
+          snapshot <- parseReply result
+          KeyMap.lookup "backend_ref" (paramsFields (toJSON snapshot))
+            `shouldBe` KeyMap.lookup "backend_ref" (paramsFields result)
+      )
+      [headlessReplyFixture, tmuxReplyFixture]
 
 wireParamsSpec :: Spec
 wireParamsSpec = do
