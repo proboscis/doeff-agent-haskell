@@ -3,8 +3,9 @@ name: doeff-agent-haskell
 version: 0.1.0.0
 synopsis: Haskell client for doeff-agentd
 license: MIT
-author: s22625
-maintainer: s22625
+license-file: LICENSE
+author: proboscis
+maintainer: proboscis
 build-type: Simple
 extra-source-files:
     test/fixtures/*.json
