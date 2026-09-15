@@ -1,1 +1,11 @@
+# cabal の build 出力
 dist-newstyle/
+
+# cabal configure が書く環境ごとのローカル設定(共有しない)
+cabal.project.local
+
+# coding agent の個人状態(共有する指示は repo 直下の指示ファイル側に置く)
+.claude/
+
+# macOS の Finder が置く状態
+.DS_Store

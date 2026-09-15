@@ -1,0 +1,29 @@
+# main への push と pull request で scripts/check.sh を走らせる。
+# GHC / cabal の版は ACP の CI(agent-control-plane の haskell job)と同じ pin で、
+# 手元の実測環境(GHC 9.12.3 / cabal-install 3.16.1.0)と揃えている。
+# public repo の GitHub-hosted runner を使う(有料の minutes・self-hosted runner は使わない)。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: haskell-actions/setup@v2
+        with:
+          ghc-version: '9.12.3'
+          cabal-version: '3.16.1.0'
+
+      # runner は package list を持たないので、検査の前に 1 回だけ取る。
+      - name: cabal update
+        run: cabal update
+
+      - name: scripts/check.sh
+        run: ./scripts/check.sh
